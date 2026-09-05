@@ -1,14 +1,14 @@
-name: Ekstrak ZIP ke Repositori & Build Android
+name: Ekstrak ZIP dan Build APK Android
 
 on:
   workflow_dispatch:
     inputs:
       zip_file_name:
-        description: 'Nama file ZIP (contoh: project.zip atau kosongkan jika otomatis deteksi)'
+        description: 'Nama file ZIP (opsional, kosongkan jika deteksi otomatis)'
         required: false
         default: ''
       auto_build_apk:
-        description: 'Langsung build APK setelah ekstrak? (true/false)'
+        description: 'Build Android APK otomatis setelah diekstrak? (true/false)'
         required: false
         default: 'true'
         type: boolean
@@ -20,8 +20,11 @@ permissions:
   contents: write
 
 jobs:
-  extract-and-commit:
-    name: Ekstrak ZIP & Perbarui Repositori
+  # ============================================================================
+  # TAHAP 1: EKSTRAK FILE ZIP SECARA AMAN (BEBAS ERROR OVERWRITE .github)
+  # ============================================================================
+  ekstrak-zip:
+    name: 🗜️ Ekstrak ZIP ke Repositori
     runs-on: ubuntu-latest
 
     steps:
@@ -30,7 +33,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 🔍 Cari & Validasi File ZIP
+      - name: 🔍 Cari File ZIP
         id: find_zip
         run: |
           ZIP_NAME="${{ github.event.inputs.zip_file_name }}"
@@ -39,53 +42,61 @@ jobs:
           fi
 
           if [ -z "$ZIP_NAME" ] || [ ! -f "$ZIP_NAME" ]; then
-            echo "❌ Tidak ditemukan file .zip di root repositori."
+            echo "❌ Tidak ditemukan file .zip di repositori."
             exit 1
           fi
 
           echo "File ZIP ditemukan: $ZIP_NAME"
           echo "zip_file=$ZIP_NAME" >> $GITHUB_OUTPUT
 
-      - name: 📦 Ekstrak File ZIP
+      - name: 📦 Ekstrak & Salin Rekursif (Aman)
         run: |
           ZIP_NAME="${{ steps.find_zip.outputs.zip_file }}"
-          echo "Mengekstrak $ZIP_NAME ke folder sementara..."
+          echo "Mengekstrak $ZIP_NAME..."
           mkdir -p temp_extracted
           unzip -q -o "$ZIP_NAME" -d temp_extracted
 
-          echo "Memindahkan isi ke root repositori secara aman..."
+          # Jika di dalam ZIP ada folder .github, salin isinya secara aman
           if [ -d "temp_extracted/.github" ]; then
             mkdir -p .github
             cp -rf temp_extracted/.github/* .github/ 2>/dev/null || true
             rm -rf temp_extracted/.github
           fi
 
+          # Salin seluruh isi proyek ke root tanpa 'mv' agar tidak bentrok
           cp -rT temp_extracted/ .
           rm -rf temp_extracted
           rm -f "$ZIP_NAME"
-          echo "✅ Berhasil diekstrak ke root repositori."
 
-      - name: 💾 Simpan dan Push File ke Repositori GitHub
+          echo "✅ Ekstraksi selesai dan file siap disimpan."
+
+      - name: 💾 Commit & Push ke Repositori
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           git add -A
           if git diff --staged --quiet; then
-            echo "ℹ️ Tidak ada perubahan baru untuk di-commit."
+            echo "ℹ️ Tidak ada perubahan berkas."
           else
             git commit -m "Auto-extract ZIP: update codebase [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
             echo "✅ Kode berhasil di-push ke branch ${{ github.ref_name }}!"
           fi
 
-  trigger-build:
-    name: Build Web Assets & PWA Android
-    needs: extract-and-commit
+  # ============================================================================
+  # TAHAP 2: BUILD WEB & APK ANDROID REALTIME
+  # ============================================================================
+  build-apk:
+    name: 🤖 Build Android APK Real-Time
+    needs: ekstrak-zip
     if: ${{ github.event.inputs.auto_build_apk != 'false' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: 📥 Checkout Source Terbaru
+      - name: 📥 Checkout Kode Terbaru
         uses: actions/checkout@v4
 
       - name: 🟢 Setup Node.js v20
@@ -94,14 +105,52 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      - name: 📦 Install Dependensi
-        run: npm ci || npm install
+      - name: ☕ Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
 
-      - name: ⚙️ Build Web Application
-        run: npm run build
+      - name: 📱 Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: 🚀 Upload Artifact Web Production
+      - name: 📦 Install Dependensi & Capacitor
+        run: |
+          npm ci || npm install
+          npm install --save-dev @capacitor/core @capacitor/cli @capacitor/android
+
+      - name: 🔍 Linter Code Verification
+        run: npm run lint
+
+      - name: 🌐 Build Web App (Injeksi Supabase Realtime)
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || vars.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          npm run build
+
+      - name: 🤖 Kompilasi Android APK
+        run: |
+          npx cap init "TGP Management" "com.tgp.management" --web-dir dist
+          npx cap add android || echo "Folder android sudah ada."
+          npx cap sync android
+
+          echo "allprojects { configurations.all { exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'; exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8' } }" >> android/build.gradle
+          echo "configurations.all { exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'; exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8' }" >> android/app/build.gradle
+          echo "android.enableJetifier=true" >> android/gradle.properties
+
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cd ..
+
+          mkdir -p output_artifacts
+          cp android/app/build/outputs/apk/debug/app-debug.apk output_artifacts/TGP-Management-Realtime.apk
+          echo "✅ File APK berhasil dibuat!"
+
+      - name: 📤 Upload File APK ke Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: web-production-dist
-          path: dist/
+          name: TGP-Management-Android-APK
+          path: output_artifacts/TGP-Management-Realtime.apk
+          retention-days: 30
