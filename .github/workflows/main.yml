@@ -1,0 +1,107 @@
+name: Ekstrak ZIP ke Repositori & Build Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_file_name:
+        description: 'Nama file ZIP (contoh: project.zip atau kosongkan jika otomatis deteksi)'
+        required: false
+        default: ''
+      auto_build_apk:
+        description: 'Langsung build APK setelah ekstrak? (true/false)'
+        required: false
+        default: 'true'
+        type: boolean
+  push:
+    paths:
+      - '*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-commit:
+    name: Ekstrak ZIP & Perbarui Repositori
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repositori
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Cari & Validasi File ZIP
+        id: find_zip
+        run: |
+          ZIP_NAME="${{ github.event.inputs.zip_file_name }}"
+          if [ -z "$ZIP_NAME" ]; then
+            ZIP_NAME=$(ls -t *.zip 2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$ZIP_NAME" ] || [ ! -f "$ZIP_NAME" ]; then
+            echo "❌ Tidak ditemukan file .zip di root repositori."
+            exit 1
+          fi
+
+          echo "File ZIP ditemukan: $ZIP_NAME"
+          echo "zip_file=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      - name: 📦 Ekstrak File ZIP
+        run: |
+          ZIP_NAME="${{ steps.find_zip.outputs.zip_file }}"
+          echo "Mengekstrak $ZIP_NAME ke folder sementara..."
+          mkdir -p temp_extracted
+          unzip -q -o "$ZIP_NAME" -d temp_extracted
+
+          echo "Memindahkan isi ke root repositori secara aman..."
+          if [ -d "temp_extracted/.github" ]; then
+            mkdir -p .github
+            cp -rf temp_extracted/.github/* .github/ 2>/dev/null || true
+            rm -rf temp_extracted/.github
+          fi
+
+          cp -rT temp_extracted/ .
+          rm -rf temp_extracted
+          rm -f "$ZIP_NAME"
+          echo "✅ Berhasil diekstrak ke root repositori."
+
+      - name: 💾 Simpan dan Push File ke Repositori GitHub
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          if git diff --staged --quiet; then
+            echo "ℹ️ Tidak ada perubahan baru untuk di-commit."
+          else
+            git commit -m "Auto-extract ZIP: update codebase [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Kode berhasil di-push ke branch ${{ github.ref_name }}!"
+          fi
+
+  trigger-build:
+    name: Build Web Assets & PWA Android
+    needs: extract-and-commit
+    if: ${{ github.event.inputs.auto_build_apk != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Source Terbaru
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js v20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 📦 Install Dependensi
+        run: npm ci || npm install
+
+      - name: ⚙️ Build Web Application
+        run: npm run build
+
+      - name: 🚀 Upload Artifact Web Production
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-production-dist
+          path: dist/
